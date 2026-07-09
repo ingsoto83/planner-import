@@ -9,6 +9,11 @@ type StoredToken = {
   error?: "RefreshAccessTokenError";
 };
 
+function usesSecureAuthCookies() {
+  const authUrl = process.env.AUTH_URL ?? process.env.NEXTAUTH_URL ?? "";
+  return authUrl.startsWith("https://");
+}
+
 async function refreshAccessToken(token: StoredToken) {
   const tenantId = process.env.AZURE_AD_TENANT_ID;
   if (!token.refreshToken || !tenantId) {
@@ -44,10 +49,17 @@ async function refreshAccessToken(token: StoredToken) {
 }
 
 export async function getServerAccessToken(req: Request) {
-  const token = (await getToken({
+  const secureCookie = usesSecureAuthCookies();
+  const token = ((await getToken({
     req,
     secret: process.env.AUTH_SECRET,
-  })) as StoredToken | null;
+    secureCookie,
+  })) ??
+    (await getToken({
+      req,
+      secret: process.env.AUTH_SECRET,
+      secureCookie: !secureCookie,
+    }))) as StoredToken | null;
 
   if (!token?.accessToken) {
     return null;
