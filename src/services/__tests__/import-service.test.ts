@@ -46,6 +46,15 @@ describe("validateImportRows", () => {
       http.get("https://graph.microsoft.com/v1.0/users/noexiste%40empresa.com", () =>
         HttpResponse.json({ error: { code: "Request_ResourceNotFound", message: "Not found" } }, { status: 404 }),
       ),
+      http.get("https://graph.microsoft.com/v1.0/me", () =>
+        HttpResponse.json({
+          id: "current-user",
+          displayName: "Current User",
+          mail: "current.user@empresa.com",
+          userPrincipalName: "current.user@empresa.com",
+        }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/users", () => HttpResponse.json({ value: [] })),
     );
 
     const response = await validateImportRows("token", {
@@ -168,5 +177,112 @@ describe("validateImportRows", () => {
     expect(completed?.results[0]?.estado).toBe("Error");
     expect(completed?.results[0]?.mensaje).toContain("no permite asignarlo en este Plan/Bucket");
     expect(completed?.results[0]?.mensaje).toContain("request-1");
+  });
+
+  it("falls back to /me when a current external user cannot be resolved by /users/{mail}", async () => {
+    server.use(
+      http.get("https://graph.microsoft.com/v1.0/planner/plans/plan-1/details", () =>
+        HttpResponse.json({
+          "@odata.etag": 'W/"plan"',
+          categoryDescriptions: {
+            category1: "Desarrollo",
+          },
+        }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/planner/buckets/bucket-1/tasks", () =>
+        HttpResponse.json({ value: [] }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/users/maria.trevino%40servicioexterno.com.mx", () =>
+        HttpResponse.json({ error: { code: "BadRequest", message: "Bad request" } }, { status: 400 }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/me", () =>
+        HttpResponse.json({
+          id: "current-user",
+          displayName: "Treviño Garcia Maria Fernanda",
+          mail: "maria.trevino@servicioexterno.com.mx",
+          userPrincipalName: "maria.trevino_servicioexterno.com.mx#EXT#@tenant.onmicrosoft.com",
+        }),
+      ),
+    );
+
+    const response = await validateImportRows("token", {
+      options: {
+        planId: "plan-1",
+        bucketId: "bucket-1",
+        fileName: "planner.xlsx",
+        createMissingLabels: false,
+        detectDuplicates: true,
+        omitDuplicates: true,
+      },
+      rows: [
+        {
+          rowNumber: 2,
+          titulo: "Tarea usuario actual",
+          responsables: ["maria.trevino@servicioexterno.com.mx"],
+          responsableRaw: "maria.trevino@servicioexterno.com.mx",
+          fechaInicio: "2026-07-14",
+          fechaVencimiento: "2026-07-15",
+          tareas: "",
+          etiqueta: "Desarrollo",
+          etiquetaNormalizada: "desarrollo",
+        },
+      ],
+    });
+
+    expect(response.rows[0]?.status).toBe("valid");
+    expect(response.rows[0]?.resolvedUsers[0]?.id).toBe("current-user");
+  });
+
+  it("keeps preview usable when duplicate detection returns Graph 400", async () => {
+    server.use(
+      http.get("https://graph.microsoft.com/v1.0/planner/plans/plan-1/details", () =>
+        HttpResponse.json({
+          "@odata.etag": 'W/"plan"',
+          categoryDescriptions: {
+            category1: "Desarrollo",
+          },
+        }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/planner/buckets/bucket-1/tasks", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "BadRequest",
+              message: "Invalid bucket query",
+              innerError: { "request-id": "duplicate-request" },
+            },
+          },
+          { status: 400 },
+        ),
+      ),
+    );
+
+    const response = await validateImportRows("token", {
+      options: {
+        planId: "plan-1",
+        bucketId: "bucket-1",
+        fileName: "planner.xlsx",
+        createMissingLabels: false,
+        detectDuplicates: true,
+        omitDuplicates: true,
+      },
+      rows: [
+        {
+          rowNumber: 2,
+          titulo: "Tarea sin responsable",
+          responsables: [],
+          responsableRaw: "",
+          fechaInicio: "2026-07-14",
+          fechaVencimiento: "2026-07-15",
+          tareas: "",
+          etiqueta: "Desarrollo",
+          etiquetaNormalizada: "desarrollo",
+        },
+      ],
+    });
+
+    expect(response.rows[0]?.status).toBe("warning");
+    expect(response.rows[0]?.issues[0]?.message).toContain("No fue posible detectar duplicados");
+    expect(response.rows[0]?.issues[0]?.message).toContain("duplicate-request");
   });
 });

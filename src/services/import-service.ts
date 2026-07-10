@@ -6,7 +6,7 @@ import pLimit from "p-limit";
 import { appConfig } from "@/lib/config";
 import { compareDateOnly, graphDateTimeFromDateOnly } from "@/lib/dates/planner-date";
 import { importValidationRequestSchema, normalizeTextKey } from "@/lib/excel/schema";
-import { isGraphApiError } from "@/lib/graph/graph-errors";
+import { GraphApiError, isGraphApiError } from "@/lib/graph/graph-errors";
 import { PlannerService, labelMapFromDescriptions } from "@/lib/graph/planner-service";
 import { UsersService } from "@/lib/graph/users-service";
 import type {
@@ -99,14 +99,32 @@ async function resolveLabelMap(options: ImportOptions, rows: NormalizedTaskRow[]
 }
 
 async function duplicateMap(options: ImportOptions, plannerService: PlannerService) {
-  if (!options.detectDuplicates) return new Map<string, GraphPlannerTask>();
-  const existingTasks = await plannerService.listBucketTasks(options.bucketId);
-  return new Map(
-    existingTasks.map((task) => [
-      duplicateKey(task.title, localDateFromGraphDateTime(task.dueDateTime)),
-      task,
-    ]),
-  );
+  if (!options.detectDuplicates) return { duplicates: new Map<string, GraphPlannerTask>() };
+
+  try {
+    const existingTasks = await plannerService.listBucketTasks(options.bucketId);
+    return {
+      duplicates: new Map(
+        existingTasks.map((task) => [
+          duplicateKey(task.title, localDateFromGraphDateTime(task.dueDateTime)),
+          task,
+        ]),
+      ),
+    };
+  } catch (error) {
+    if (error instanceof GraphApiError && [400, 403, 404].includes(error.status)) {
+      const requestId = error.requestId ? ` (requestId: ${error.requestId})` : "";
+      return {
+        duplicates: new Map<string, GraphPlannerTask>(),
+        warning: issue(
+          "duplicado",
+          "warning",
+          `No fue posible detectar duplicados en este Bucket. La validación continúa sin bloquear la importación.${requestId}`,
+        ),
+      };
+    }
+    throw error;
+  }
 }
 
 export async function validateImportRows(token: string, request: ImportValidationRequest): Promise<ImportValidationResponse> {
@@ -115,12 +133,13 @@ export async function validateImportRows(token: string, request: ImportValidatio
   const plannerService = new PlannerService(token);
   const usersService = new UsersService(token);
   const labelMap = await resolveLabelMap(parsed.options, parsed.rows, plannerService);
-  const duplicates = await duplicateMap(parsed.options, plannerService);
+  const duplicateResult = await duplicateMap(parsed.options, plannerService);
 
   const rows: ValidatedImportRow[] = [];
 
   for (const row of parsed.rows) {
     const issues = validationIssues(row);
+    if (duplicateResult.warning) issues.push(duplicateResult.warning);
     const { users, issues: userIssues } = await resolveUsers(row, usersService);
     issues.push(...userIssues);
 
@@ -129,7 +148,7 @@ export async function validateImportRows(token: string, request: ImportValidatio
       issues.push(issue("etiqueta", "error", `Etiqueta "${row.etiqueta}" no existe en el Plan seleccionado.`));
     }
 
-    const duplicate = duplicates.get(duplicateKey(row.titulo, row.fechaVencimiento));
+    const duplicate = duplicateResult.duplicates.get(duplicateKey(row.titulo, row.fechaVencimiento));
     const shouldOmit = Boolean(duplicate && parsed.options.omitDuplicates);
     if (duplicate) {
       issues.push(
